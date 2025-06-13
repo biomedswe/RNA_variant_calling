@@ -1,4 +1,5 @@
 # RNA Variant Calling Pipeline
+# Created 2025-06-13 by Jonas Andersson
 
 This project provides a **Nextflow-based pipeline** for performing variant calling on RNA-seq FASTQ files. It is designed to be modular, reproducible, and scalable for high-throughput analysis on Unix-based systems.
 
