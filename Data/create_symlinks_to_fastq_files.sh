@@ -1,67 +1,116 @@
 #!/bin/bash
 
-# Description:
-# For each unique batch in the CSV, this script finds all files inside the corresponding directory
-# (from the 'Full path in server' column) and creates symlinks to them in the subfolder HTL2_fastq_files,
-# using the same filenames.
+# -------------------------------
+# Overview:
+# This script reads a CSV file where each row corresponds to a sample.
+# It collects sample IDs from column 2 and uses them to filter FASTQ files found in specified folders (column 5).
+# It creates symbolic links to matched FASTQ files in a central output directory, renaming them consistently.
+# -------------------------------
 
+# Input CSV file with sample metadata (semicolon-delimited)
 csv_file="map_to_fastq_HTL2_168_samples.csv"
-output_dir="HTL2_fastq_files"
-echo "Running: $csv_file"
 
-# Ensure file has Unix line endings
+# Output directory where symbolic links will be created
+output_dir="HTL2_fastq_files"
+echo "Running on CSV: $csv_file"
+
+# Ensure the CSV uses Unix-style line endings (in case edited in Windows)
 dos2unix "$csv_file" 2>/dev/null
 
-# Create the output directory if it doesn't exist
+# Create the output directory if it doesn't already exist
 mkdir -p "$output_dir"
+echo "Output directory: $output_dir"
 
-# Extract unique folder paths based on first occurrence of each batch
-awk -F';' '                        # Use semicolon as field delimiter (since CSV uses ; not ,)
+# -------------------------------
+# Step 1: Build list of allowed sample IDs
+# -------------------------------
 
-  NR > 1 && !seen[$3]++ {          # For all rows *except* the header (NR > 1):
-                                   #   - $3 refers to the "batch" column
-                                   #   - seen[$3] is an associative array that keeps track of how many times each batch value appears
-                                   #   - !seen[$3]++ means: only evaluate true the *first time* we see a given batch
-                                   #     (it returns true when seen[$3] == 0, then increments the count)
+# Declare an associative array to store allowed sample IDs (e.g., HTL214)
+declare -A allowed_ids
 
-    print $5;                      # Print the "Full path in server" column (field 5), once per unique batch
-  }
+echo ""
+echo "Extracting allowed IDs from column 2..."
 
-' "$csv_file" | while read -r path; do # Pipe the paths into the while-loop
+# Loop through each line (after the header), splitting on semicolon
+# Only column 2 is extracted (the numeric ID), all others are ignored using `_`
+while IFS=';' read -r _ id _ _ _; do
+  # Remove whitespace from the ID, just in case
+  id_trimmed=$(echo "$id" | tr -d '[:space:]')
 
+  # Add "HTL" prefix to the ID to form a standardized format (e.g., 214 → HTL214)
+  allowed_id="HTL${id_trimmed}"
+
+  # Store the formatted ID in the associative array
+  allowed_ids["$allowed_id"]=1
+done < <(tail -n +2 "$csv_file")  # Skip the first (header) line
+
+# -------------------------------
+# Step 2: Scan directories listed in column 5 and create symlinks
+# -------------------------------
+
+echo ""
+echo "Scanning directories..."
+
+# Extract one unique directory path per batch (column 5, using column 3 for uniqueness)
+# This avoids scanning the same directory multiple times
+awk -F';' 'NR > 1 && !seen[$3]++ { print $5 }' "$csv_file" | while read -r path; do
+  echo ""
   echo "Processing directory: $path"
 
-  # Check if directory exists
+  # Make sure the path is a directory
   if [ -d "$path" ]; then
-    # Loop over each .fastq.gz file inside the path
+    # Loop over all .fastq.gz files in the folder
     for file in "$path"/*.fastq.gz; do
-      # Get the base filename (without path)
-      filename=$(basename "$file")
-      echo "Found file: $filename"
-      
+      # If no file matches, skip iteration
+      [ -e "$file" ] || continue
 
-      # Check if the filename starts with "HTL"
-      # =~ is used for regex matching in bash
-      if [[ "$filename" =~ ^HTL ]]; then
-        continue  # Skip files that already start with "HTL"
-      elif [[ "$filename" =~ ^[0-9] ]]; then
-        filename="HTL$filename"
-      else
-        echo "Skipping file (invalid prefix): $filename"
-        continue
+      # Get just the filename (no path)
+      filename=$(basename "$file")
+      echo "  Found file: $filename"
+
+      # -------------------------------
+      # Step 2a: Normalize filename prefix
+      # -------------------------------
+
+      # Extract the prefix (i.e., the first token before the first underscore)
+      prefix=$(echo "$filename" | cut -d'_' -f1)
+
+      # If the prefix doesn't start with HTL, add it
+      if [[ ! "$prefix" =~ ^HTL ]]; then
+        prefix="HTL$prefix"
       fi
 
-      # Print what symlink is being created
-      echo "Creating symlink: $output_dir/$filename -> $file"
+      # Normalize: remove any leading zeros after HTL (e.g., HTL00214 → HTL214)
+      normalized_prefix=$(echo "$prefix" | sed -E 's/^HTL0*/HTL/')
 
-      # Create the symbolic link in the output directory
-      ln -s "$file" "$output_dir/$filename"
+      echo "    Original prefix: $prefix"
+      echo "    Normalized prefix: $normalized_prefix"
+
+      # -------------------------------
+      # Step 2b: Check if this sample is in the allowed list
+      # -------------------------------
+
+      # If the normalized prefix matches one of the allowed IDs...
+      if [[ ${allowed_ids["$normalized_prefix"]+_} ]]; then
+        # Replace the original prefix in filename with normalized prefix
+        # Keeps the rest of the filename the same
+        symlink_name="$normalized_prefix$(echo "$filename" | sed -E 's/^([^_]+)//')"
+
+        echo "Match found — Creating symlink: $output_dir/$symlink_name"
+
+        # Create symbolic link pointing to original file, but using new name in the output directory
+        ln -s "$file" "$output_dir/$symlink_name"
+      else
+        echo "Skipped — $normalized_prefix not in allowed list."
+      fi
+
+      # Optional: sleep for debugging or rate-limiting (no effect here)
+      sleep 0
     done
   else
-    # Print a warning if the directory doesn't exist
     echo "Directory not found: $path"
   fi
-
 done
-# End of script
-echo "Symlinks created in directory: $output_dir"
+
+echo ""
+echo "Done. Symlinks created in: $output_dir"
