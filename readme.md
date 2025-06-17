@@ -33,3 +33,4 @@ Create the Conda environment with:
 conda env create -f environment.yml
 conda activate variant_calling
 
+Note: trim-galore 0.6.10 with settings --paired had to be run separately outside environment due to dependency issues
