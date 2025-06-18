@@ -4,6 +4,8 @@ Processed_files/
 Processed_files/STAR_genome_GRCh38_100_gencode_v43/
 Data/HTL2_fastq_files/
 Data/concatenated_fastq_files/
+Data/QC_fastq_files/
+QC/
 
 # Ignore Nextflow logs and metadata
 Logs/
