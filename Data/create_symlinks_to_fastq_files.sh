@@ -33,16 +33,23 @@ echo "Extracting allowed IDs from column 2..."
 
 # Loop through each line (after the header), splitting on semicolon
 # Only column 2 is extracted (the numeric ID), all others are ignored using `_`
-while IFS=';' read -r _ id _ _ _; do
+while IFS=';' read -r _ id batch _ _; do
+  # Skip row if column 2 contains "dont_select"
+  [[ "$id" == *dont_select* ]] && continue
+
   # Remove whitespace from the ID, just in case
   id_trimmed=$(echo "$id" | tr -d '[:space:]')
+  batch_trimmed=$(echo "$batch" | tr -d '[:space:]')
 
-  # Add "HTL" prefix to the ID to form a standardized format (e.g., 214 → HTL214)
-  allowed_id="HTL${id_trimmed}"
+   # Combine both columns for a unique key, e.g., "HTL214_180830"
+  allowed_id="HTL${id_trimmed}_${batch_trimmed}"
+  
 
   # Store the formatted ID in the associative array
   allowed_ids["$allowed_id"]=1
 done < <(tail -n +2 "$csv_file")  # Skip the first (header) line
+
+
 
 # -------------------------------
 # Step 2: Scan directories listed in column 5 and create symlinks
@@ -86,22 +93,30 @@ awk -F';' 'NR > 1 && !seen[$3]++ { print $5 }' "$csv_file" | while read -r path;
       echo "    Original prefix: $prefix"
       echo "    Normalized prefix: $normalized_prefix"
 
-      # -------------------------------
+        # -------------------------------
       # Step 2b: Check if this sample is in the allowed list
       # -------------------------------
 
-      # If the normalized prefix matches one of the allowed IDs...
-      if [[ ${allowed_ids["$normalized_prefix"]+_} ]]; then
-        # Replace the original prefix in filename with normalized prefix
-        # Keeps the rest of the filename the same
+      # Extract the batch name from the path (e.g., last folder in the path)
+      batch_from_path=$(basename "$path")
+
+      # Combine normalized prefix and batch to match allowed_ids key
+      normalized_id_batch="${normalized_prefix}_${batch_from_path}"
+      echo "normalized_id_batch": ${normalized_id_batch}
+      
+
+      # +_ is a way to test if an array key exists
+      # It does not access the value — only checks presence of the key
+      # The _ is just a placeholder and could be replaced with anything non-empty
+      if [[ ${allowed_ids["$normalized_id_batch"]+_} ]]; then
+
+        # Replace original prefix in filename with normalized prefix
         symlink_name="$normalized_prefix$(echo "$filename" | sed -E 's/^([^_]+)//')"
 
         echo "Match found — Creating symlink: $output_dir/$symlink_name"
-
-        # Create symbolic link pointing to original file, but using new name in the output directory
         ln -s "$file" "$output_dir/$symlink_name"
       else
-        echo "Skipped — $normalized_prefix not in allowed list."
+        echo "Skipped — ${normalized_id_batch} not in allowed list."
       fi
 
       # Optional: sleep for debugging or rate-limiting (no effect here)
