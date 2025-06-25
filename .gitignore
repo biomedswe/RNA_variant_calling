@@ -1,10 +1,9 @@
 # Ignore WASP symlink and raw/generated data
 Scripts/WASP/WASP/
 Processed_files/
-Processed_files/STAR_genome_GRCh38_100_gencode_v43/
 Data/HTL2_fastq_files/
 Data/concatenated_fastq_files/
-Data/QC_fastq_files/
+Data/map_to_fastq_HTL2_168_samples.csv
 QC/
 
 # Ignore Nextflow logs and metadata
