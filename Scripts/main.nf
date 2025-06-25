@@ -63,130 +63,80 @@ workflow {
 
 
     
-    // // ------------------------------------------
-    // // STEP 2: FASTQC ON CONCATENATED FILES
-    // // ------------------------------------------
+    // ------------------------------------------
+    // STEP 2: FASTQC ON CONCATENATED FILES
+    // ------------------------------------------
 
     raw_fastqc_out_ch = fastqc(concat_fastq_out_ch)
 
 
-    // // ------------------------------------------
-    // // STEP 3: MULTIQC ON RAW FASTQ FILES
-    // // ------------------------------------------
+    // ------------------------------------------
+    // STEP 3: MULTIQC ON RAW FASTQ FILES
+    // ------------------------------------------
 
-    // // print the collected FastQC outputs for debugging
-    // // .collect consume the channel and return a single list of all FastQC outputs
-    // multiqc_input_ch = raw_fastqc_out_ch.collect()
-    
-    // // multiqc_input_ch.view { collected ->
-    // // "Collected FastQC outputs:\n" + collected*.getName().join("\n")
-    // // }
+    raw_multiqc_input_ch = raw_fastqc_out_ch.fastqc_htmls // Collect all HTML reports
+    .mix(raw_fastqc_out_ch.fastqc_zips)     // Mix with ZIP reports for MultiQC
+    .collect() // Collect into a single channel for MultiQC
 
-    // // Collect all outputs from fastqc
-    // multiqc(multiqc_input_ch) // Collects all FastQC outputs and sends them to MultiQC. without .collect() it would send each file separately, which is not what we want.
+    multiqc_raw(raw_multiqc_input_ch)
 
-    // // multiqc_input_ch = fastqc_out_ch.flatten().collect()
-    // // multiqc_input_ch.view { collected ->
-    // // "Collected FastQC outputs:\n" + collected*.getName().join("\n")
-    // // }
-    // // multiqc(multiqc_input_ch)
-
-    raw_multiqc_input_ch = raw_fastqc_out_ch.fastqc_htmls
-    .mix(raw_fastqc_out_ch.fastqc_zips)
-    .collect()
-
-    multiqc(raw_multiqc_input_ch)
-
-    // // ==============================================
-    // // STEP 4: QC ON CONCATENATED FASTQ FILES WITH TRIM GALORE
-    // // ==============================================
-
-    // trim_galore_input_ch = Channel
-    //     .fromFilePairs("${params.concat_fastq_dir}/*_R{1,2}.fastq.gz", flat: false)
-    //     .filter { sample_id, reads -> reads.size() == 2 }
-    //     .map { sample_id, reads -> 
-    //         tuple(sample_id, reads[0], reads[1])
-    //     }
-
-    //     // for debugging, print the input to Trim Galore
-    //     // .view { "TrimGalore input tuple: ${it[0]}, R1: ${it[1].getName()}, R2: ${it[2].getName()}" }
-
-    // trim_galore_output_ch = trim_galore(trim_galore_input_ch)
-
-    
     // ==============================================
-    // STEP 4: QC ON RAW FASTQ FILES WITH TRIM GALORE
+    // STEP 4: QC ON CONCATENATED FASTQ FILES WITH TRIM GALORE
     // ==============================================
 
-// trim_galore_input_ch = concat_fastq_out_ch
-//     // Step 1: Strip _R1/_R2 to get sample ID
-//     .map { sample_read, file -> 
-//         def sample_id = sample_read.replaceAll(/_R[12]$/, '')
-//         tuple(sample_id, file)
-//     }
-//     .view { "After .map → (sample_id, file): $it" }
+    trim_galore_input_ch = Channel
+        .fromFilePairs("${params.concat_fastq_dir}/*_R{1,2}.fastq.gz", flat: false)
+        .filter { sample_id, reads -> reads.size() == 2 }
+        .map { sample_id, reads -> 
+            tuple(sample_id, reads[0], reads[1])
+        }
 
-    // // Step 2: Group all files for the same sample
-    // .groupTuple(by: 0)
-    // .view { "After .groupTuple → (sample_id, [files]): $it" }
+        // for debugging, print the input to Trim Galore
+        // .view { "TrimGalore input tuple: ${it[0]}, R1: ${it[1].getName()}, R2: ${it[2].getName()}" }
 
-    // // Step 3: Find R1 and R2 files and prepare for TrimGalore
-    // .map { sample_id, files ->
-    //     def r1 = files.find { it.getFileName().toString().contains('_R1') }
-    //     def r2 = files.find { it.getFileName().toString().contains('_R2') }
-    //     tuple(sample_id, r1, r2)
-    // }
-    // .view { "Final TrimGalore input → (sample_id, R1, R2): $it" }
+    trim_galore_output_ch = trim_galore(trim_galore_input_ch)
 
+    // ------------------------------------------
+    // STEP 5: MULTIQC ON TRIMMED FILES
+    // ------------------------------------------
 
+   trimmed_fastqc_ch = trim_galore_output_ch.fastqc_htmls
+    // Get the FastQC HTML outputs from Trim Galore
 
-    // Start with the output from concat_fastq (one merged FASTQ file per R1 or R2 read)
-    // Example input: ("HTL123_R1", path/to/HTL123_R1.fastq.gz)
-    // trim_galore_input_ch = concat_fastq_out_ch
-    // // Converts: ("HTL123_R1", file1) → ("HTL123", file1)
-    // // Converts: ("HTL123_R2", file2) → ("HTL123", file2)
-    // // This strips the _R1 or _R2 from the filename to extract a common sample ID (like "HTL123"), so both files can be grouped together.
-    // .map { sample_read, file -> 
-    //     def sample_id = sample_read.replaceAll(/_R[12]$/, '')  // Strip _R1 or _R2
-    //     tuple(sample_id, file)  // Return a tuple: (sample_id, file)
-    // }
-
-    // .groupTuple(by: 0)
-   
-    // // Example: ("HTL123", [("HTL123", file1), ("HTL123", file2)]) → ("HTL123", file1, file2)
-    // .map { sample_read, file_list ->
-    // def r1 = file_list.find { it[1].name.contains('_R1') }[1]
-    // def r2 = file_list.find { it[1].name.contains('_R2') }[1]
-    // tuple(sample_read, r1, r2)
-    // }
-
-    // // // This final channel (trim_input_ch) looks like:
-    // // // ("HTL123", file1_R1.fastq.gz, file2_R2.fastq.gz)
-    // // // and is sent into the trim_galore process
-    // trim_galore_output_ch = trim_galore(trim_galore_input_ch)
-
-    // // ------------------------------------------
-    // // STEP 4: MULTIQC ON TRIMMED FILES
-    // // ------------------------------------------
-
-    // // mix combines the two channels into one, so MultiQC can process both HTML and ZIP files together
-    // trimmed_fastqc_ch = trim_galore_output_ch.fastqc_htmls
-    //     .mix(trim_galore_output_ch.fastqc_zips)
-    //     .view { "Trimmed FastQC output: ${it.getName()}" }
-
-    // multiqc(trimmed_fastqc_ch)
-  
-
+        .mix(trim_galore_output_ch.fastqc_zips)
+        // Combine them with the FastQC ZIP outputs
+        .mix(trim_galore_output_ch.trimming_reports)
+        // Mix in the trimming reports for MultiQC
+        .mix(trim_galore_output_ch.trimmed_reads_R1)
+        // Include the trimmed reads R1         
+        .mix(trim_galore_output_ch.trimmed_reads_R2)
+        // Include the trimmed reads R2
+        .flatten()
+        // Convert grouped file lists into a flat stream of individual files
     
+        .collect()
+        // Gather all individual files into a single list for MultiQC
+    
+        // .view { "Trimmed FastQC output:\n" + it*.getName().join('\n') }
+        // (Optional) Print all collected filenames for debugging
+
+    multiqc_trimmed(trimmed_fastqc_ch)
+    // Run MultiQC on the collected FastQC outputs
+
 
     // ------------------------------------------
     // STEP 4: PICARD FastqToSam (paired-end)
     // ------------------------------------------
-    // Channel
-    //     .fromFilePairs("${params.trimgalore_output_dir}/*_R{1,2}.fastq.gz", flat: true)
-    //     .filter { sample_id, reads -> reads.size() == 2 }
-    //     .map    { sample_id, reads -> tuple(sample_id, reads[0], reads[1]) }
-    //     | fastqtosam
+    // fastqtosam_input_ch = Channel
+    // .fromFilePairs("${params.trimgalore_output_dir}/HTL284*R{1,2}_val_{1,2}.fq.gz", flat: true)
+    // .map { sample_id, reads -> 
+    //     tuple(sample_id, reads[0], reads[1])
+    // }
+    // .view()
+    
+  
+
+    // fastqtosam(fastqtosam_input_ch)
 }
 
 
@@ -250,15 +200,37 @@ process fastqc {
     """
 }
 
-// =============================
-// PROCESS: MULTIQC
-// =============================
+// ====================================
+// PROCESS: MULTIQC ON RAW FASTQC FILES
+// ====================================
 
-process multiqc {
+process multiqc_raw {
 
     tag "multiqc_raw_fastq"
 
-    publishDir params.multiqc_dir, mode: params.publish_mode
+    publishDir params.multiqc_raw_dir, mode: params.publish_mode
+
+    input:
+    path fastqc_dirs
+
+    output:
+    path "multiqc_report.html"
+
+    script:
+    """
+    multiqc . -o . 
+    """
+}
+
+// ========================================
+// PROCESS: MULTIQC ON TRIMMED FASTQC FILES
+// ========================================
+
+process multiqc_trimmed {
+
+    tag "multiqc_trimmed_fastq"
+
+    publishDir params.multiqc_trimmed_dir, mode: params.publish_mode
 
     input:
     path fastqc_dirs
@@ -300,15 +272,20 @@ process trim_galore {
     """
     echo "[DEBUG] Running Trim Galore on: ${read1} and ${read2} for sample ${sample_id}"
 
-    # Normalize input filenames using symlinks
-    ln -s "${read1}" "${sample_id}_1.fastq.gz"
-    ln -s "${read2}" "${sample_id}_2.fastq.gz"
-
-    # Run Trim Galore with FastQC
-    # Capture stdout and stderr
-    trim_galore --paired "${sample_id}_1.fastq.gz" "${sample_id}_2.fastq.gz" --gzip --fastqc --output_dir . \
+    trim_galore \\
+        --paired \\
+        -a " AGATCGGAAGAGC -a G{50}" \\
+        -a2 " AGATCGGAAGAGC -a G{50}" \\
+        --quality 20 \\
+        --clip_R1 5 \\
+        --clip_R2 5 \\
+        --length 20 \\
+        --cores 4 \\
+        --gzip \\
+        --fastqc \\
+        --output_dir . \\
+        "${read1}" "${read2}" \\
         > trim_galore_${sample_id}.log 2> trim_galore_${sample_id}.err
-    
     """
 }
 // =============================
@@ -328,11 +305,18 @@ process fastqtosam {
 
     script:
     """
+    echo "[DEBUG] Running Picard FastqToSam for sample: ${sample_id}"
+
     picard FastqToSam \\
         F1=${read1} \\
         F2=${read2} \\
-        O=${sample_id}.bam \\
+        O=${sample_id}_unmapped.bam \\
         SM=${sample_id} \\
-        SORT_ORDER=queryname
+        RG=${sample_id} \\
+        PL=ILLUMINA \\
+        SORT_ORDER=queryname \\
+        REFERENCE_SEQUENCE="${params.reference_genome}" \\
+        TMP_DIR="${params.tmp_dir}"
     """
+
 }
