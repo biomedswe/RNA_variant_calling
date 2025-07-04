@@ -6,6 +6,7 @@ nextflow.enable.dsl = 2
 // =============================
 workflow {
 
+   
     // ------------------------------------------
     // STEP 1: CONCATENATE RAW FASTQ FILES
     // ------------------------------------------
@@ -26,6 +27,7 @@ workflow {
             tuple("${sample}_${read}", file)
         }
         .groupTuple(by: 0)
+        .filter { sample_read, files -> sample_read.startsWith('HTL214') } // <-- Filter for HTL214
         
         .map { sample_read, files ->
         def logFile = new File("Logs/concat_input_preview.log")
@@ -47,7 +49,7 @@ workflow {
 
 
     // Step 5: Concatenate files for each sample+read group
-    concat_fastq_out_ch = concat_fastq(raw_reads_ch)
+    concat_fastq_out_ch = Concatenating_fastq(raw_reads_ch)
         .map { file ->  // `file` is a Path object returned by the process
         def logFile = new File("Logs/fastq_input_preview.log")
          if (!logFile.exists() || logFile.length() == 0) {
@@ -67,7 +69,7 @@ workflow {
     // STEP 2: FASTQC ON CONCATENATED FILES
     // ------------------------------------------
 
-    raw_fastqc_out_ch = fastqc(concat_fastq_out_ch)
+    raw_fastqc_out_ch = FastQC(concat_fastq_out_ch)
 
 
     // ------------------------------------------
@@ -91,8 +93,16 @@ workflow {
             tuple(sample_id, reads[0], reads[1])
         }
 
-        // for debugging, print the input to Trim Galore
-        // .view { "TrimGalore input tuple: ${it[0]}, R1: ${it[1].getName()}, R2: ${it[2].getName()}" }
+    trim_galore_input_ch = Channel
+    // 1. collect only proper R1/R2 pairs
+    .fromFilePairs("${params.concat_fastq_dir}/*_R{1,2}.fastq.gz")
+    // 2. keep only the samples of interest
+    .filter { sample_id, reads -> sample_id.startsWith('HTL214') }
+    // 3. explode the pair into three elements if that’s what the next
+    //    process expects (otherwise drop this map)
+    .map { sample_id, reads -> tuple(sample_id, reads[0], reads[1]) }
+    // for debugging, print the input to Trim Galore
+    // .view { "TrimGalore input tuple: ${it[0]}, R1: ${it[1].getName()}, R2: ${it[2].getName()}" }
 
     trim_galore_output_ch = trim_galore(trim_galore_input_ch)
 
@@ -127,17 +137,88 @@ workflow {
     // ------------------------------------------
     // STEP 4: PICARD FastqToSam (paired-end)
     // ------------------------------------------
-    // fastqtosam_input_ch = Channel
-    // .fromFilePairs("${params.trimgalore_output_dir}/HTL284*R{1,2}_val_{1,2}.fq.gz", flat: true)
-    // .map { sample_id, reads -> 
-    //     tuple(sample_id, reads[0], reads[1])
-    // }
-    // .view()
-    
-  
 
-    // fastqtosam(fastqtosam_input_ch)
+    // Join the R1 and R2 files on their sample prefix
+    fastqtosam_align_reads_input_ch = trim_galore_output_ch.trimmed_reads_R1
+        .combine(trim_galore_output_ch.trimmed_reads_R2)
+        .map { r1, r2 ->
+            def sample_id = r1.getName().replaceFirst(/_R1_val_1\.fq\.gz$/, '') // Full file name with extensions
+            tuple(sample_id, r1, r2)
+        }
+        
+    // Input trimmed fastq files from trim_galore
+    fastqtosam_ch = FastqToSam(fastqtosam_align_reads_input_ch)
+    
+    // View FastqToSam output
+    // fastqtosam_ch.view { ">> fastqtosam_ch: ${it}" }
+
+
+
+
+    // ------------------------------------------
+    // STEP 5: STAR ALIGNMENT
+    // ------------------------------------------
+
+    // Input trimmed fastq files from trim_galore
+    alignreads_ch = AlignReads(fastqtosam_align_reads_input_ch)
+
+    // View AlignReads output
+    // alignreads_ch.view { ">> alignreads_ch: ${it}" }
+
+   
+
+
+    // ------------------------------------------
+    // STEP 5: MergeBamAlignment
+    // ------------------------------------------
+
+    // Join unmapped and mapped channels, when your channels emit tuples, default is that the first element in each tuple is used as the key for joining.
+    paired_bams_ch = fastqtosam_ch.join(alignreads_ch)
+
+    // View joined output
+    // paired_bams_ch.view { ">> paired_bams_ch: ${it}" }
+
+    markduplicates_input_ch = MergeBamAlignment(paired_bams_ch)
+
+    // ------------------------------------------
+    // STEP 5: MarkDuplicates
+    // ------------------------------------------
+
+    splitncigarreads_input_ch = MarkDuplicates(markduplicates_input_ch)
+    .map { sample_id, bam_file, bai_file ->
+        tuple(sample_id, bam_file)  // drop the bai_file
+    }
+
+    
+    // ------------------------------------------
+    // STEP 5: SplitNCigarReads
+    // ------------------------------------------
+
+    base_recalibrator_input_ch = SplitNCigarReads(splitncigarreads_input_ch)
+
+    // ------------------------------------------
+    // STEP 6: BaseRecalibrator
+    // ------------------------------------------
+
+    base_recalibrator_out_ch = BaseRecalibrator(base_recalibrator_input_ch)
+
+    // Remap to pass BAM + recal table to ApplyBQSR
+    apply_bqsr_input_ch = base_recalibrator_out_ch
+    .combine(base_recalibrator_input_ch) { recal, bam ->
+        def sample_id_recal = recal[0]
+        def recal_table    = recal[1]
+        def sample_id_bam  = bam[0]
+        def bam_file       = bam[1]
+
+        assert sample_id_recal == sample_id_bam : "Sample IDs don't match!"
+        tuple(sample_id_bam, bam_file, recal_table)
+    }
+
+// Step 7: ApplyBQSR
+ApplyBQSR(apply_bqsr_input_ch)
+
 }
+
 
 
 
@@ -149,11 +230,9 @@ workflow {
 // =============================
 // PROCESS: CONCATENATE FASTQ
 // =============================
-process concat_fastq {
+process Concatenating_fastq {
 
     tag "${sample_read}"
-
-    publishDir params.concat_fastq_dir, mode: params.publish_mode
 
     input:
     tuple val(sample_read), path(fastq_files)
@@ -162,16 +241,38 @@ process concat_fastq {
     path "${sample_read}.fastq.gz"
 
     script:
+    // This is groovy code and therefore outside the triple quotes
+    // Define the output file name based on the sample name
     def output_file = "${sample_read}.fastq.gz"
+       
+    // - If there's only one input FASTQ file, just copy it (no need to concatenate).
+    // - If there are multiple FASTQ files (e.g., multiple lanes for the same sample),
+    //   concatenate them into a single output file using 'cat'.
     def cmd = fastq_files.size() == 1
-        ? "cp ${fastq_files[0]} ${output_file}"
-        : "cat ${fastq_files.join(' ')} > ${output_file}"
+        ? "cp ${fastq_files[0]} ${output_file}"                        // Case: only one file — use 'cp'
+        : "cat ${fastq_files.join(' ')} > ${output_file}"              // Case: multiple files — use 'cat' to merge
+
+    
 
     """
-    mkdir -p ${params.log_dir}
-    echo "→ Merging files for ${sample_read}" >&2
-    ${cmd}
-    echo "✅ Created: ${output_file}" >&2
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] ${task.process} lanes for: ${task.tag}" >> "\$PWD/.command.out"
+    
+    if ! ${cmd}; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
     """
 }
 
@@ -179,11 +280,9 @@ process concat_fastq {
 // =============================
 // PROCESS: FASTQC
 // =============================
-process fastqc {
+process FastQC {
 
     tag { input_file.getBaseName() }
-
-    publishDir params.fastqc_dir, mode: params.publish_mode
 
     input:
     path input_file
@@ -193,10 +292,27 @@ process fastqc {
     path "*fastqc.zip", emit: fastqc_zips
 
     script:
+
+    
     """
-    echo "🔍 Running FastQC on ${input_file.getName()}" >&2
-    fastqc ${input_file} --outdir .
-    echo "✅ FastQC done for ${input_file.getName()}" >&2
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "🔍 Running ${task.process} on ${task.tag}" >> "\$PWD/.command.out"
+    
+    if ! fastqc ${input_file} --outdir . >> \$PWD/.command.out 2>> \$PWD/.command.err ; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} was succesful for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
     """
 }
 
@@ -208,8 +324,6 @@ process multiqc_raw {
 
     tag "multiqc_raw_fastq"
 
-    publishDir params.multiqc_raw_dir, mode: params.publish_mode
-
     input:
     path fastqc_dirs
 
@@ -217,8 +331,29 @@ process multiqc_raw {
     path "multiqc_report.html"
 
     script:
+    
+
     """
-    multiqc . -o . 
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "🔍 Running ${task.process} on ${task.tag}" >> "\$PWD/.command.out"
+    
+    # append stdout and stderr
+    if ! multiqc . -o . 1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} was succesful for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+     
     """
 }
 
@@ -230,8 +365,6 @@ process multiqc_trimmed {
 
     tag "multiqc_trimmed_fastq"
 
-    publishDir params.multiqc_trimmed_dir, mode: params.publish_mode
-
     input:
     path fastqc_dirs
 
@@ -239,8 +372,29 @@ process multiqc_trimmed {
     path "multiqc_report.html"
 
     script:
+    
+
     """
-    multiqc . -o . 
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "🔍 Running ${task.process} on ${task.tag}" >> "\$PWD/.command.out"
+    
+    # append stdout and stderr
+    if ! multiqc . -o . 1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} was succesful for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+     
     """
 }
 
@@ -252,10 +406,6 @@ process trim_galore {
 
     tag "${sample_id}"
 
-    publishDir "QC/trimmed_fastqc_reports", pattern: "*_fastqc.*", mode: params.publish_mode
-    publishDir "QC/trimmed_fastqc_reports", pattern: "*trimming_report.txt", mode: params.publish_mode
-    publishDir params.trimgalore_output_dir, pattern: "*_val_*.fq.gz", mode: params.publish_mode
-
     input:
     tuple val(sample_id), path(read1), path(read2)
 
@@ -265,58 +415,412 @@ process trim_galore {
     path ("*_fastqc.html"), emit: fastqc_htmls
     path ("*_fastqc.zip"), emit: fastqc_zips
     path ("*trimming_report.txt"), optional: true, emit: trimming_reports
-    path ("trim_galore_${sample_id}.log"), emit: stdout_log
-    path ("trim_galore_${sample_id}.err"), emit: stderr_log
+    
 
     script:
+     
     """
-    echo "[DEBUG] Running Trim Galore on: ${read1} and ${read2} for sample ${sample_id}"
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
 
-    trim_galore \\
-        --paired \\
-        -a " AGATCGGAAGAGC -a G{50}" \\
-        -a2 " AGATCGGAAGAGC -a G{50}" \\
-        --quality 20 \\
-        --clip_R1 5 \\
-        --clip_R2 5 \\
-        --length 20 \\
-        --cores 4 \\
-        --gzip \\
-        --fastqc \\
-        --output_dir . \\
-        "${read1}" "${read2}" \\
-        > trim_galore_${sample_id}.log 2> trim_galore_${sample_id}.err
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+   
+    echo "🔍 Running ${task.process} on: ${read1} and ${read2} for sample ${task.tag}"
+
+    if ! trim_galore \
+        --paired \
+        -a " AGATCGGAAGAGC -a G{50}" \
+        -a2 " AGATCGGAAGAGC -a G{50}" \
+        --quality 20 \
+        --clip_R1 5 \
+        --clip_R2 5 \
+        --length 20 \
+        --cores 4 \
+        --gzip \
+        --fastqc \
+        --output_dir . \
+        "${read1}" "${read2}" \
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${read1} and ${read2} for sample ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} was succesful for ${read1} and ${read2} for sample ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
     """
 }
-// =============================
-// PROCESS: PICARD FastqToSam (paired-end)
-// =============================
-process fastqtosam {
+
+// ==========================
+// PROCESS: PICARD FastqToSam 
+// ==========================
+
+process FastqToSam {
 
     tag { "${sample_id}" }
-
-    publishDir params.fastqtosam_output_dir, mode: params.publish_mode
 
     input:
     tuple val(sample_id), path(read1), path(read2)
 
     output:
-    path "${sample_id}.bam"
+    tuple val(sample_id), path("${sample_id}_unmapped.bam")
+    
 
-    script:
+   script:
+    
+
     """
-    echo "[DEBUG] Running Picard FastqToSam for sample: ${sample_id}"
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
 
-    picard FastqToSam \\
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run Picard and catch failure manually
+    if ! picard FastqToSam \\
         F1=${read1} \\
         F2=${read2} \\
         O=${sample_id}_unmapped.bam \\
         SM=${sample_id} \\
         RG=${sample_id} \\
         PL=ILLUMINA \\
-        SORT_ORDER=queryname \\
+        SORT_ORDER=coordinate \\
         REFERENCE_SEQUENCE="${params.reference_genome}" \\
-        TMP_DIR="${params.tmp_dir}"
+        TMP_DIR="${params.tmp_dir}" \\
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} sucessful for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
     """
-
 }
+
+// ==========================
+// PROCESS: STAR alignReads 
+// ==========================
+
+
+process AlignReads {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(read1), path(read2)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_Aligned.sortedByCoord.out.bam")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run STAR and catch failures manually
+    if ! STAR \
+        --runMode alignReads \
+        --genomeDir ${params.star_genome} \
+        --runThreadN ${task.cpus} \
+        --readFilesIn ${read1} ${read2} \
+        --readFilesCommand zcat \
+        --twopassMode Basic \
+        --sjdbOverhang 100 \
+        --outSAMtype BAM SortedByCoordinate \
+        --outFileNamePrefix ${sample_id}_ \
+        --outSAMattrRGline ID:${sample_id} SM:${sample_id} PL:ILLUMINA \
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh" "*_Log.out" "*_Log.final.out"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh" "*_Log.out" "*_Log.final.out"
+        exit 0
+    fi
+    """
+}
+
+// ==========================
+// PROCESS: MergeBamAlignment
+// ==========================
+
+process MergeBamAlignment {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(unmapped_bam), path(aligned_bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_merged_unmapped_mapped.bam")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+
+    if ! picard MergeBamAlignment \
+        UNMAPPED_BAM=${unmapped_bam} \
+        ALIGNED_BAM=${aligned_bam} \
+        REFERENCE_SEQUENCE=${params.reference_genome} \
+        OUTPUT="${sample_id}_merged_unmapped_mapped.bam" \
+        TMP_DIR="${params.tmp_dir}" \
+        SORT_ORDER=coordinate \
+        INCLUDE_SECONDARY_ALIGNMENTS=false \
+        VALIDATION_STRINGENCY=SILENT \
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+}
+    
+// ==========================
+// PROCESS: MarkDuplicates
+// ==========================
+
+process MarkDuplicates {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_MarkDuplicates.bam"), path("${sample_id}_MarkDuplicates.bai")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run Picard MarkDuplicates
+    if ! java -Xmx20g -jar /ludc/Home/jonas_a/.conda/pkgs/picard-3.3.0-hdfd78af_0/share/picard-3.3.0-0/picard.jar MarkDuplicates \
+        I=${input_bam} \
+        O=${sample_id}_MarkDuplicates.bam \
+        M=${sample_id}_marked-dup-metrics.txt \
+        CREATE_INDEX=true \
+        ASSUME_SORTED=true \
+        TMP_DIR=${params.tmp_dir} \
+        VALIDATION_STRINGENCY=SILENT \
+        1>> \$PWD/.command.out 2>&1; then
+
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+    
+}
+
+
+// ==========================
+// PROCESS: SplitNCigarReads
+// ==========================
+
+process SplitNCigarReads {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_SplitNCigarReads.bam")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run GATK SplitNCigarReads
+    if ! gatk SplitNCigarReads \
+        -R ${params.reference_genome} \
+        -I ${input_bam} \
+        -O ${sample_id}_SplitNCigarReads.bam \
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+    
+}
+
+// ==========================
+// PROCESS: BaseRecalibrator
+// ==========================
+
+process BaseRecalibrator {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_recal_data.table")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run GATK BaseRecalibrator
+    if ! java -Djava.io.tmpdir=${params.tmp_dir} \
+        -XX:GCTimeLimit=50 \
+        -XX:GCHeapFreeLimit=10 \
+        -XX:+PrintFlagsFinal \
+        -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
+        -Xms4000m \
+        -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+        BaseRecalibrator \
+        -R ${params.reference_genome} \
+        -I ${input_bam} \
+        -OQ \
+        --known-sites ${params.snp_sites}/resources_broad_hg38_v0_Homo_sapiens_assembly38.dbsnp138.vcf \
+        --known-sites ${params.snp_sites}/resources_broad_hg38_v0_1000G_phase1.snps.high_confidence.hg38.vcf.gz \
+        --known-sites ${params.snp_sites}/resources_broad_hg38_v0_Mills_and_1000G_gold_standard.indels.hg38.vcf.gz \
+        -O "${sample_id}_recal_data.table" \
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+    
+}
+
+// ================================
+// PROCESS: Apply BaseRecalibration
+// ================================
+
+process ApplyBQSR {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam), path(recal_table)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_recalibrated.bam")
+
+    script:
+    
+
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run GATK BaseRecalibrator
+    if ! java -Djava.io.tmpdir=${params.tmp_dir} \
+    -XX:GCTimeLimit=50 \
+    -XX:GCHeapFreeLimit=10 \
+    -XX:+PrintFlagsFinal \
+    -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
+    -Xms4000m \
+    -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+    ApplyBQSR \
+    --add-output-sam-program-record \
+    --use-original-qualities \
+    --bqsr-recal-file ${recal_table} \
+    -R ${params.reference_genome} \
+    -I ${input_bam} \
+    -O "${sample_id}_recalibrated.bam" \
+
+
+    
+        1>> \$PWD/.command.out 2>&1; then
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+    
+}
+
+
+
+
+
+
+
+
+	
