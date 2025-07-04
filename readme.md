@@ -13,9 +13,13 @@ This project provides a **Nextflow-based pipeline** for performing variant calli
 ## 📁 Project Structure
 
 Scripts/ # Nextflow scripts and pipeline logic
+
 Data/ # Input files like sample metadata
+
 Processed_files/ # Output directory (ignored by Git)
+
 Logs/ # Pipeline logs and diagnostics
+
 environment.yml # Conda environment for reproducibility
 
 
@@ -33,18 +37,3 @@ Create the Conda environment with:
 conda env create -f environment.yml
 conda activate variant_calling
 
-✂️ Trim Galore Summary
-
-Trimming mode: paired-end
-Trim Galore version: 0.6.10
-Cutadapt version: 2.6
-Python version: 3.7.12          
-Number of cores used for trimming: 8
-Quality Phred score cutoff: 20
-Quality encoding type selected: ASCII+33
-Adapter sequence: 'AGATCGGAAGAGC' (Illumina TruSeq, Sanger iPCR; auto-detected)
-Maximum trimming error rate: 0.1 (default)
-Minimum required adapter overlap (stringency): 1 bp
-Minimum required sequence length for both reads before a sequence pair gets removed: 20 bp
-
-Note: Trim Galore was executed outside the main Conda environment due to dependency conflicts.
