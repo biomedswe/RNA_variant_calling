@@ -82,16 +82,16 @@ workflow {
 
     multiqc_raw(raw_multiqc_input_ch)
 
-    // ==============================================
+    // =======================================================
     // STEP 4: QC ON CONCATENATED FASTQ FILES WITH TRIM GALORE
-    // ==============================================
+    // =======================================================
 
-    trim_galore_input_ch = Channel
-        .fromFilePairs("${params.concat_fastq_dir}/*_R{1,2}.fastq.gz", flat: false)
-        .filter { sample_id, reads -> reads.size() == 2 }
-        .map { sample_id, reads -> 
-            tuple(sample_id, reads[0], reads[1])
-        }
+    // trim_galore_input_ch = Channel
+    //     .fromFilePairs("${params.concat_fastq_dir}/*_R{1,2}.fastq.gz", flat: false)
+    //     .filter { sample_id, reads -> reads.size() == 2 }
+    //     .map { sample_id, reads -> 
+    //         tuple(sample_id, reads[0], reads[1])
+    //     }
 
     trim_galore_input_ch = Channel
     // 1. collect only proper R1/R2 pairs
@@ -135,7 +135,7 @@ workflow {
 
 
     // ------------------------------------------
-    // STEP 4: PICARD FastqToSam (paired-end)
+    // STEP 6: STAR ALIGNMENT
     // ------------------------------------------
 
     // Join the R1 and R2 files on their sample prefix
@@ -147,74 +147,54 @@ workflow {
         }
         
     // Input trimmed fastq files from trim_galore
-    fastqtosam_ch = FastqToSam(fastqtosam_align_reads_input_ch)
-    
-    // View FastqToSam output
-    // fastqtosam_ch.view { ">> fastqtosam_ch: ${it}" }
-
-
-
-
-    // ------------------------------------------
-    // STEP 5: STAR ALIGNMENT
-    // ------------------------------------------
-
-    // Input trimmed fastq files from trim_galore
-    alignreads_ch = AlignReads(fastqtosam_align_reads_input_ch)
+    alignreads_output_ch = AlignReads(fastqtosam_align_reads_input_ch)
 
     // View AlignReads output
     // alignreads_ch.view { ">> alignreads_ch: ${it}" }
 
-   
-
-
     // ------------------------------------------
-    // STEP 5: MergeBamAlignment
+    // STEP 7: MarkDuplicates
     // ------------------------------------------
 
-    // Join unmapped and mapped channels, when your channels emit tuples, default is that the first element in each tuple is used as the key for joining.
-    paired_bams_ch = fastqtosam_ch.join(alignreads_ch)
-
-    // View joined output
-    // paired_bams_ch.view { ">> paired_bams_ch: ${it}" }
-
-    markduplicates_input_ch = MergeBamAlignment(paired_bams_ch)
-
-    // ------------------------------------------
-    // STEP 5: MarkDuplicates
-    // ------------------------------------------
-
-    splitncigarreads_input_ch = MarkDuplicates(markduplicates_input_ch)
+    splitncigarreads_input_ch = MarkDuplicates(alignreads_output_ch)
     .map { sample_id, bam_file, bai_file ->
         tuple(sample_id, bam_file)  // drop the bai_file
     }
 
     
     // ------------------------------------------
-    // STEP 5: SplitNCigarReads
+    // STEP 8: SplitNCigarReads
     // ------------------------------------------
 
-    base_recalibrator_input_ch = SplitNCigarReads(splitncigarreads_input_ch)
+    splitncigarreads_output_ch = SplitNCigarReads(splitncigarreads_input_ch)
+    splitncigarreads_output_ch.view { "splitncigarreads_output_ch: ${it}"}
 
     // ------------------------------------------
-    // STEP 6: BaseRecalibrator
+    // STEP 9: BaseRecalibrator
     // ------------------------------------------
 
-    base_recalibrator_out_ch = BaseRecalibrator(base_recalibrator_input_ch)
+    base_recalibrator_out_ch = BaseRecalibrator(splitncigarreads_output_ch)
+
+    base_recalibrator_out_ch.view { "base_recalibrator_out_ch: ${it}"}
 
     // Remap to pass BAM + recal table to ApplyBQSR
+//    apply_bqsr_input_ch = base_recalibrator_out_ch
+//     .join(splitncigarreads_output_ch) // .join is best practice for joining channels when they are related
+//     .map { sample_id, recal, bam ->
+//         def recal_table = recal[1]
+//         def bam_file    = bam[1]
+//         tuple(sample_id, bam_file, recal_table)
+//     }
+//     .view { "apply_bqsr_input_ch: ${it}" }
+
     apply_bqsr_input_ch = base_recalibrator_out_ch
-    .combine(base_recalibrator_input_ch) { recal, bam ->
-        def sample_id_recal = recal[0]
-        def recal_table    = recal[1]
-        def sample_id_bam  = bam[0]
-        def bam_file       = bam[1]
+        .join(splitncigarreads_output_ch)
+        .map { sample_id, recal_table, bam_file ->
+            tuple(sample_id, bam_file, recal_table)
+        }
+        .view { "apply_bqsr_input_ch: ${it}" }
 
-        assert sample_id_recal == sample_id_bam : "Sample IDs don't match!"
-        tuple(sample_id_bam, bam_file, recal_table)
-    }
-
-// Step 7: ApplyBQSR
+// Step 10: ApplyBQSR
 ApplyBQSR(apply_bqsr_input_ch)
 
 }
@@ -454,56 +434,6 @@ process trim_galore {
     """
 }
 
-// ==========================
-// PROCESS: PICARD FastqToSam 
-// ==========================
-
-process FastqToSam {
-
-    tag { "${sample_id}" }
-
-    input:
-    tuple val(sample_id), path(read1), path(read2)
-
-    output:
-    tuple val(sample_id), path("${sample_id}_unmapped.bam")
-    
-
-   script:
-    
-
-    """
-    # Source shared functions
-    source ${params.script_dir}/nextflow_functions.sh
-
-    export LOG_DIR="${params.log_dir}/${task.process}"
-    export TAG="${task.tag}"
-    mkdir -p "\$LOG_DIR"
-
-    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
-
-    # Run Picard and catch failure manually
-    if ! picard FastqToSam \\
-        F1=${read1} \\
-        F2=${read2} \\
-        O=${sample_id}_unmapped.bam \\
-        SM=${sample_id} \\
-        RG=${sample_id} \\
-        PL=ILLUMINA \\
-        SORT_ORDER=coordinate \\
-        REFERENCE_SEQUENCE="${params.reference_genome}" \\
-        TMP_DIR="${params.tmp_dir}" \\
-        1>> \$PWD/.command.out 2>&1; then
-        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
-        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
-        exit 1
-    else
-        echo "✅ ${task.process} sucessful for ${task.tag}" >> "\$PWD/.command.out"
-        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
-        exit 0
-    fi
-    """
-}
 
 // ==========================
 // PROCESS: STAR alignReads 
@@ -533,18 +463,44 @@ process AlignReads {
 
     echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
 
+    # ------------------------------------------------------------------
+    # 1. Derive read-group (RG) fields from the first FASTQ header
+    #    Header template: @<instrument>:<run>:<FLOWCELL>:<LANE>:...
+    # ------------------------------------------------------------------
+    
+    header=\$(zcat -f ${read1} | head -1)                               # @NB501805:7:H3GG7BGX3:1:11101:...
+    flowcell=\$(echo "\$header" | cut -d ':' -f3)                       # e.g. H3GG7BGX3
+    lane=\$(echo     "\$header" | cut -d ':' -f4)                       # e.g. 1
+    barcode=\$(echo  "\$header" | awk '{print \$2}' | cut -d ':' -f4)   # e.g. CGATGT
+
+    LB="\${flowcell}_\${barcode}"       # library
+    PU="\${flowcell}.\${lane}"          # platform-unit
+    PL="ILLUMINA"                       # platform
+    RG_LINE="ID:${sample_id} SM:${sample_id} LB:\${LB} PU:\${PU} PL:\${PL}"
+
+    echo "[DEBUG] RG → \$RG_LINE" >> "\$PWD/.command.out"
+
     # Run STAR and catch failures manually
     if ! STAR \
         --runMode alignReads \
         --genomeDir ${params.star_genome} \
+        --genomeLoad NoSharedMemory \
         --runThreadN ${task.cpus} \
         --readFilesIn ${read1} ${read2} \
         --readFilesCommand zcat \
         --twopassMode Basic \
+        --alignEndsType EndToEnd \
+        --outFilterMultimapNmax 1 \
         --sjdbOverhang 100 \
+        --alignIntronMin 20 \
+        --alignIntronMax 1000000 \
+        outFilterMismatchNoverLmax 0.04 \
         --outSAMtype BAM SortedByCoordinate \
+        --outSAMattributes NH HI AS nM NM MD jM jI rB MC vA vG vW \
+        --waspOutputMode SAMtag \
         --outFileNamePrefix ${sample_id}_ \
-        --outSAMattrRGline ID:${sample_id} SM:${sample_id} PL:ILLUMINA \
+        --outSAMattrRGline \$RG_LINE \
+        --outSAMunmapped Within \
         1>> \$PWD/.command.out 2>&1; then
         echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
         move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh" "*_Log.out" "*_Log.final.out"
@@ -552,55 +508,6 @@ process AlignReads {
     else
         echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
         move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh" "*_Log.out" "*_Log.final.out"
-        exit 0
-    fi
-    """
-}
-
-// ==========================
-// PROCESS: MergeBamAlignment
-// ==========================
-
-process MergeBamAlignment {
-
-    tag { "${sample_id}" }
-
-    input:
-    tuple val(sample_id), path(unmapped_bam), path(aligned_bam)
-
-    output:
-    tuple val(sample_id), path("${sample_id}_merged_unmapped_mapped.bam")
-
-    script:
-    
-
-    """
-    # Source shared functions
-    source ${params.script_dir}/nextflow_functions.sh
-
-    export LOG_DIR="${params.log_dir}/${task.process}"
-    export TAG="${task.tag}"
-    mkdir -p "\$LOG_DIR"
-
-    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
-
-
-    if ! picard MergeBamAlignment \
-        UNMAPPED_BAM=${unmapped_bam} \
-        ALIGNED_BAM=${aligned_bam} \
-        REFERENCE_SEQUENCE=${params.reference_genome} \
-        OUTPUT="${sample_id}_merged_unmapped_mapped.bam" \
-        TMP_DIR="${params.tmp_dir}" \
-        SORT_ORDER=coordinate \
-        INCLUDE_SECONDARY_ALIGNMENTS=false \
-        VALIDATION_STRINGENCY=SILENT \
-        1>> \$PWD/.command.out 2>&1; then
-        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
-        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
-        exit 1
-    else
-        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
-        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
         exit 0
     fi
     """
@@ -736,7 +643,7 @@ process BaseRecalibrator {
         -XX:+PrintFlagsFinal \
         -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
         -Xms4000m \
-        -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+        -jar /ludc/Home/jonas_a/.conda/envs/variant_calling_py310/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
         BaseRecalibrator \
         -R ${params.reference_genome} \
         -I ${input_bam} \
@@ -792,7 +699,7 @@ process ApplyBQSR {
     -XX:+PrintFlagsFinal \
     -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
     -Xms4000m \
-    -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+    -jar /ludc/Home/jonas_a/.conda/envs/variant_calling_py310/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
     ApplyBQSR \
     --add-output-sam-program-record \
     --use-original-qualities \
@@ -816,6 +723,160 @@ process ApplyBQSR {
     
 }
 
+
+// ========================
+// PROCESS: HaplotypeCaller
+// ========================
+
+process HaplotypeCaller {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_haplotypecaller.vcf.gz")
+
+    script:
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run GATK HaplotypeCaller
+    if ! java -Djava.io.tmpdir=${params.tmp_dir} \
+        -Xms6000m \
+        -XX:GCTimeLimit=50 \
+        -XX:GCHeapFreeLimit=10 \
+        -XX:+PrintFlagsFinal \
+        -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
+        -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+        HaplotypeCaller \
+        -R ${params.reference_genome} \
+        -I ${input_bam} \
+        -O "${sample_id}_haplotypecaller.vcf.gz" \
+        --dont-use-soft-clipped-bases \
+        --dbsnp ${params.snp_sites}/resources_broad_hg38_v0_Homo_sapiens_assembly38.dbsnp138.vcf \
+        1>> \$PWD/.command.out 2>&1; then
+
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+
+    else
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    fi
+    """
+}
+
+// ==========================
+// PROCESS: VariantFiltration
+// ==========================
+
+process VariantFiltration {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_vcf)
+
+    output:
+    tuple val(sample_id), path("${sample_id}_filtered.vcf.gz")
+
+    script:
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run GATK VariantFiltration
+    if ! java -Djava.io.tmpdir=${params.tmp_dir} \
+        -Xms6000m \
+        -XX:GCTimeLimit=50 \
+        -XX:GCHeapFreeLimit=10 \
+        -XX:+PrintFlagsFinal \
+        -Xlog:gc*:file=gc_log.log:time,uptime,level,tags \
+        -jar /ludc/Home/jonas_a/.conda/envs/variant_calling/share/gatk4-4.6.1.0-0/gatk-package-4.6.1.0-local.jar \
+        VariantFiltration \
+        -R ${params.reference_genome} \
+        -V ${input_vcf} \
+        -window 35 \
+        -cluster 3 \
+        --filter-name "FS" -filter "FS > 30.0" \
+        --filter-name "QD" -filter "QD < 2.0" \
+        -O "${sample_id}_filtered.vcf.gz" \
+        1>> \$PWD/.command.out 2>&1; then
+
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+
+    else
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+    fi
+    """
+}
+
+// =============================
+// PROCESS: FindIntersectingSNPs
+// =============================
+
+process FindIntersectingSNPs {
+
+    tag { "${sample_id}" }
+
+    input:
+    tuple val(sample_id), path(input_bam), path(filtered_vcf)
+
+    output:
+    tuple val(sample_id), path("*_remap.bam"), path("*_remap.fq.gz"), path("*_to_remap.bam")
+
+    script:
+    """
+    # Source shared functions
+    source ${params.script_dir}/nextflow_functions.sh
+
+    export LOG_DIR="${params.log_dir}/${task.process}"
+    export TAG="${task.tag}"
+    mkdir -p "\$LOG_DIR"
+
+    echo "[DEBUG] 🔍 Running ${task.process} for sample: ${task.tag}" >> "\$PWD/.command.out"
+
+    # Run find_intersecting_snps.py
+    if ! python ${params.wasp_dir}/mapping/find_intersecting_snps.py \
+        --is_paired_end \
+        --is_sorted \
+        --output_dir . \
+        --snp_dir ${filtered_vcf} \
+        ${input_bam} \
+        1>> \$PWD/.command.out 2>&1; then
+
+        echo "❌ ${task.process} failed for ${task.tag}" >> "\$PWD/.command.err"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 1
+
+    else
+        echo "✅ ${task.process} done for ${task.tag}" >> "\$PWD/.command.out"
+        move_named_log ".command.condor" ".command.err" ".command.out" ".command.run" ".command.sh"
+        exit 0
+    fi
+    """
+}
 
 
 
