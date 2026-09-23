@@ -553,8 +553,6 @@ process SplitCleanReads {
     tuple val(sample_id), val("${sample_id}_R1"), path("${sample_id}_clean_R1.fastq.gz"), emit: trimmed_reads_R1
     tuple val(sample_id), val("${sample_id}_R2"), path("${sample_id}_clean_R2.fastq.gz"), emit: trimmed_reads_R2
 
-    // tuple val(sample_id), path("${sample_id}_clean_R1.fastq.gz"), path("${sample_id}_clean_R2.fastq.gz")
-
     script:
 
     """
@@ -1286,7 +1284,7 @@ process FilterRemapReads {
 
     tag { "${sample_id}" }
 
-    // recalibrated_to_remap: input BAM file containing original set of reads that needed to be remapped after having their alleles  flipped. This file is output by the find_intersecting_snps.py script.
+    // recalibrated_to_remap: input BAM file containing original set of reads that needed to be remapped after having their alleles flipped. This file is output by the find_intersecting_snps.py script.
     // remap_bam: input BAM file containing remapped reads (with flipped alleles)
     input:
     tuple val(sample_id), path(recalibrated_to_remap), path(remapped_bam)
