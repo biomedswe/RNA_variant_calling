@@ -197,4 +197,3 @@ dependencies:
   - zlib-ng=2.2.4=h7955e40_0
   - zstandard=0.23.0=py310ha75aee5_2
   - zstd=1.5.6=ha6fb4c9_0
-prefix: /ludc/Home/jonas_a/.conda/envs/variant_calling_py310

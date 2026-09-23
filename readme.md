@@ -2,7 +2,7 @@
 
 **Created 2025-06-13 by Jonas Andersson**
 
-This project provides a **Nextflow-based pipeline** for variant calling and allele-specific expression analysis from RNA-seq FASTQ files. It is designed to be modular, reproducible, and scalable for high-throughput analysis on Unix-based systems.
+This project provides a **Nextflow-based pipeline** for calling genetic variants from RNA-seq FASTQ files. The identified variants can be used for downstream analyses, such as allele-specific expression (ASE) analysis. The pipeline is designed to be modular, reproducible, and suitable for processing large numbers of samples on Unix-based systems.
 
 ## 📦 Features
 

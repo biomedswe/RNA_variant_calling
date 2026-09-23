@@ -19,63 +19,45 @@ include { FeatureCounts as FeatureCounts_reversely_stranded  } from './modules/f
 // =============================
 workflow {
 
-   
     // ------------------------------------------
     // STEP 1: CONCATENATE RAW FASTQ FILES
     // ------------------------------------------
 
     // Create a channel containing all FASTQ files that match the given glob pattern
-    // (any file ending with `.fastq.gz` inside the raw_fastq_input_dir)
-    raw_reads_ch = Channel.fromPath("${params.raw_fastq_input_dir}/*.fastq.gz")
 
-        // Apply a filter to keep only certain files from that list
-        // .filter { file ->
+     raw_reads_ch = channel
+    // Match all relevant FASTQ extensions
+    .fromPath("${params.raw_fastq_input_dir}/*.{fastq,fastq.gz,fq,fq.gz}")
 
-        //     // Extract just the file name (without its directory path)
-        //     def name = file.getName()
+    .map { file ->
+        // Extract base name (without extension)
+        def name = file.getBaseName().replaceFirst(/\.f(ast)?q(\.gz)?$/, '')
+        // Remove .fastq, .fastq.gz, .fq, .fq.gz
 
-        //     // Keep the file only if its name matches the regex:
-        //     //  ^SRR        → must start with "SRR"
-        //     //  .*          → followed by any characters (zero or more)
-        //     //  \.fastq\.gz → must end with ".fastq.gz"
-        //     //  $           → end of string
-        //     return name ==~ /^SRR.*\.fastq\.gz$/
-        // }
+        def tokens = name.split('_')
+        def sample = tokens[0]                               // first token = sample name
+        def read = (tokens.find { token -> token ==~ /(?i)^R[12]$/ } ?: 'R?').toUpperCase() // detect R1/R2 case-insensitively
 
-        .map { file ->
-            // Normalize the file name to extract sample and read info
-            
-            def name = file.getBaseName().replaceFirst(/\.f(ast)?q(\.gz)?$/, '')
-            // This regex removes:
-            // .fastq
-            // .fastq.gz
-            // .fq
-            // .fq.gz
 
-            def tokens = name.split('_')
-            // Split on underscores
-            def sample = tokens[0]
-            // First token = sample name
-            def read = tokens.find { it ==~ /^R[12]$/ } ?: 'R?'
-            // Read pair
-            tuple(sample, "${sample}_${read}", file)
-        }
-        .groupTuple(by: [0, 1]) // group by sample and sample_read
-        // .filter { sample, sample_read, files -> sample_read.startsWith('SRR11966098') } // <- Filter to include only 1 test sample
-        // .view { "Grouped samples: ${it}" } // Optional: View grouped samples
+        tuple(sample, "${sample}_${read}", file)
+    }
+
+    // Group by sample and read pair
+    .groupTuple(by: [0, 1])
+
+    // Optional: print what was grouped (useful for debugging)
+    // .view { grouped_samples -> "Grouped samples: ${grouped_samples}" }
 
         
-        
-
     // Concatenate files for each sample+read group
-    concat_fastq_out_ch = Concatenating_fastq(raw_reads_ch)
+    // If a sample has multiple files (e.g., from different lanes), they will be concatenated to 1 file per R1/R2
+    concat_fastq_out_ch = Concatenate_fastq(raw_reads_ch)
     
     // ------------------------------------------
     // STEP 2: FASTQC ON CONCATENATED FILES
     // ------------------------------------------
 
     raw_fastqc_out_ch = FastQC_Raw(concat_fastq_out_ch, 'fastqc_raw')
-
 
     // ------------------------------------------
     // STEP 3: MULTIQC ON RAW FASTQ FILES
@@ -85,37 +67,33 @@ workflow {
     .mix(raw_fastqc_out_ch.fastqc_zips)     // Mix with ZIP reports for MultiQC
     .collect() // Collect into a single channel for MultiQC
     .map { files -> tuple('multiqc_raw', files) } // Tag the collected files as "multiqc_raw"
-    // .view { "Raw MultiQC input files: ${it}" } // Optional: View the collected files
 
+    // Optional debug output
+    // .view { raw_files -> "Raw MultiQC input files: ${raw_files}" }
 
     MultiQC_Raw(raw_multiqc_input_ch)
    
-
-
 
     // =======================================================
     // STEP 4: QC ON CONCATENATED FASTQ FILES WITH TRIM GALORE
     // =======================================================
 
     trim_galore_input_ch = concat_fastq_out_ch
-    .groupTuple(by: 0, size: 2)                 // (sample, [reads], [files]) emit when 2 items with the same sample arrive
-    .map { sample, reads, files ->             // reads = ["SRR214_R1", "SRR214_R2"]
-                                              // files = [Path-to-R1, Path-to-R2]
+    .groupTuple(by: 0, size: 2)  // (sample, [read_ids], [files])
 
-        /* find the two paths by filename */
-        def r1_file = files.find { it.name.contains('_R1') }
-        def r2_file = files.find { it.name.contains('_R2') }
+    .map { sample, _reads, files -> // '_' before reads just means it's not being used
+        // Match files dynamically by name (case-insensitive)
+        def r1_file = files.find { file -> file.name =~ /(?i)_R1/ }
+        def r2_file = files.find { file -> file.name =~ /(?i)_R2/ }
 
-        tuple(sample, r1_file, r2_file)        // ("SRR214", R1_path, R2_path)
+        tuple(sample, r1_file, r2_file)
     }
-    // .filter { sample, r1_file, r2_file -> sample.startsWith('SRR214') }
-    .filter { sample, r1_file, r2_file -> 
-    def match = (sample =~ /SRR(\d+)/)
-    if (!match) return false
-    def number = match[0][1] as int
-    return number <= 11966162
-    }
-    // .view { "Sample to include: $it" }
+
+    // Keep only valid pairs
+    .filter { _sample, r1_file, r2_file -> r1_file && r2_file } // '_' before sample just means it's not being used
+
+    // Optional debug output
+    // .view { item -> "Prepared for Trim Galore: ${item[0]} | R1: ${item[1].name} | R2: ${item[2].name}" }
 
     trim_galore_output_ch = TrimGalore(trim_galore_input_ch)
 
@@ -139,8 +117,10 @@ workflow {
         .collect()
         // Gather all individual files into a single list for MultiQC
         .map { files -> tuple('multiqc_trimmed', files) } // Tag the collected files as "multiqc_raw"
-        // .view { "Trimmed MultiQC input files: ${it}" } // Optional: View the collected files
-        // (Optional) Print all collected filenames for debugging
+
+        // Optional debug output
+        // .view { trimmed -> "Trimmed MultiQC input files: ${trimmed}" }
+       
 
     MultiQC_Trimmed(trimmed_fastqc_ch)
     // Run MultiQC on the collected FastQC outputs
@@ -152,12 +132,11 @@ workflow {
 
     // Use the emited tuple with trimmed reads from Trim Galore as input for SortMeRNA
     sortmerna_input_ch = trim_galore_output_ch.trimmed_reads
-    // sortmerna_input_ch.view { "SortMeRNA input: ${it[0]} -> ${it[1].getName()}, ${it[2].getName()}" }
 
-  
+    // Optional debug output
+    // sortmerna_input_ch.view { item -> "SortMeRNA input: ${item[0]} -> ${item[1].getName()}, ${item[2].getName()}" }
 
     sortmerna_output_ch = SortMeRNA(sortmerna_input_ch)
-
 
     // ------------------------------------------------
     // STEP 7: Split interleaved reads from SortMeRNA
@@ -173,7 +152,7 @@ workflow {
     cleaned_fastqc_out_R2_ch = FastQC_Cleaned_R2(SplitCleanReads.out.trimmed_reads_R2, 'fastqc_cleaned')
 
     // ------------------------------------------
-    // STEP 5: MULTIQC ON CLEANED FILES
+    // STEP 9: MULTIQC ON CLEANED FILES
     // ------------------------------------------
 
     cleaned_multiqc_input_ch = cleaned_fastqc_out_R1_ch.fastqc_htmls
@@ -187,12 +166,12 @@ workflow {
 
 
     // ------------------------------------------
-    // STEP 6: STAR ALIGNMENT
+    // STEP 10: STAR ALIGNMENT
     // ------------------------------------------
 
     // Create channels for the reference genome and GTF files
-    reference_fasta_ch = Channel.fromPath(params.reference_genome)
-    reference_gtf_ch   = Channel.fromPath(params.reference_gtf)
+    reference_fasta_ch = channel.fromPath(params.reference_genome)
+    reference_gtf_ch   = channel.fromPath(params.reference_gtf)
 
     // Build the index (runs once) and get its emitted channel
     genome_idx_ch = GenomeGenerate(reference_fasta_ch, reference_gtf_ch)
@@ -201,171 +180,179 @@ workflow {
     align_reads_input_ch = SplitCleanReads.out.trimmed_reads_R1          // channel #1
     .join(SplitCleanReads.out.trimmed_reads_R2)                          // channel #2
     .combine(genome_idx_ch)                                              // add the genome index channel to each tuple
-    // .view { "Before map: ${it}" } 
-    .map { id, r1, pathR1, r2, pathR2, idx_dir ->                            // destructure
+   
+    .map { id, _r1, pathR1, _r2, pathR2, idx_dir ->                          // destructure, prefix '_' in r1 and r2 means they are not being used
         tuple(id, pathR1, pathR2, idx_dir)                                   // (sample, R1, R2)
     }
-    // .view { "align reads input ch: ${it}" } 
+
+    // Optional debug output
+    // .view { item -> "align reads input ch: ${item}" } 
        
         
     // Input cleaned fastq files from sortmerna
     alignreads_output_ch = AlignReads(align_reads_input_ch)
 
+    // Optional debug output
+    // alignreads_output_ch.view { item -> "alignreads_output_ch: ${item}"}
+
     // ------------------------------------------
-    // STEP 7: MarkDuplicates
+    // STEP 11: MarkDuplicates
     // ------------------------------------------
 
     markduplicates_output_ch = MarkDuplicates(alignreads_output_ch)
-    .map { sample_id, bam_file, bai_file ->
-        tuple(sample_id, bam_file)  // drop the bai_file
+    .map { sample_id, bam_file, _bai_file -> // prefix '_' before bai_file suppress warning that it's not being used
+        tuple(sample_id, bam_file) 
     }
 
     
     // ------------------------------------------
-    // STEP 8: SplitNCigarReads
+    // STEP 12: SplitNCigarReads
     // ------------------------------------------
 
     splitncigarreads_output_ch = SplitNCigarReads(markduplicates_output_ch)
-    // splitncigarreads_output_ch.view { "splitncigarreads_output_ch: ${it}"}
+
+    // Optional debug output
+    // splitncigarreads_output_ch.view { item -> "splitncigarreads_output_ch: ${item}"}
 
     // ------------------------------------------
-    // STEP 9: BaseRecalibrator
+    // STEP 13: BaseRecalibrator
     // ------------------------------------------
 
     base_recalibrator_out_ch = BaseRecalibrator(splitncigarreads_output_ch)
 
-    // base_recalibrator_out_ch.view { "base_recalibrator_out_ch: ${it}"}
+    // Optional debug output
+    // base_recalibrator_out_ch.view { item -> "base_recalibrator_out_ch: ${item}"}
 
     // Remap to pass BAM + recal table to ApplyBQSR
-    // apply_bqsr_input_ch = base_recalibrator_out_ch
-    //     .join(splitncigarreads_output_ch) // .join is best practice for joining channels when they are related
-    //     .map { sample_id, recal, bam ->
-    //         def recal_table = recal[1]
-    //         def bam_file    = bam[1]
-    //         tuple(sample_id, bam_file, recal_table)
-    //     }
-    // .view { "apply_bqsr_input_ch: ${it}" }
-
     apply_bqsr_input_ch = base_recalibrator_out_ch
-        .join(splitncigarreads_output_ch)
+        .join(splitncigarreads_output_ch) // .join is best practice for joining channels when they are related
         .map { sample_id, recal_table, bam_file ->
             tuple(sample_id, bam_file, recal_table)
         }
-        // .view { "apply_bqsr_input_ch: ${it}" }
 
-// Step 10: ApplyBQSR
-ApplyBQSR(apply_bqsr_input_ch)
-
+        // Optional debug output
+        // .view { item -> "apply_bqsr_input_ch: ${item}" }
 
 
-// ------------------------------------------
-// STEP 11: Haplotypecaller
-// ------------------------------------------
+    ApplyBQSR(apply_bqsr_input_ch)
 
-HaplotypeCaller(ApplyBQSR.out)
+    // ------------------------------------------
+    // STEP 14: Haplotypecaller
+    // ------------------------------------------
 
-// ------------------------------------------
-// STEP 12: VariantFiltration
-// ------------------------------------------
+    HaplotypeCaller(ApplyBQSR.out)
 
-VariantFiltration(HaplotypeCaller.out)
+    // ------------------------------------------
+    // STEP 15: VariantFiltration
+    // ------------------------------------------
 
-// ------------------------------------------
-// STEP 13: WASP step 1: ExtractVcfSNPs
-// ------------------------------------------
-ExtractVcfSNPs(VariantFiltration.out)
+    VariantFiltration(HaplotypeCaller.out)
 
-// ------------------------------------------
-// STEP 13: WASP step 2: FindIntersectingSNPs
-// ------------------------------------------
-
-findintersectingsnps_input_ch = ApplyBQSR.out
-.join(ExtractVcfSNPs.out)
-// .view { "Before map: ${it}"}
-.map {sample_id_bam, bam_file, txt_snps ->
-tuple(sample_id_bam, bam_file, txt_snps)
-}
-// .view { "findintersectingsnps_input_ch: ${it}"}
-
-FindIntersectingSNPs(findintersectingsnps_input_ch)
-
-// ------------------------------------------
-// STEP 13: WASP step 3: RemapReads
-// ------------------------------------------
-
-remap_reads_input_ch = FindIntersectingSNPs.out
-    .map { sample_id, fq1, fq2, single, keep_bam, to_remap_bam -> 
-    tuple(sample_id, fq1, fq2) }
-    // .view { "remap_reads_input: ${it}"}
-
-RemapReads(remap_reads_input_ch)
-
-// ------------------------------------------
-// STEP 13: WASP step 4: FilterRemapReads
-// ------------------------------------------
-
-filter_remap_reads_input_ch = FindIntersectingSNPs.out
-    .join(RemapReads.out)
-    // .view { "Before map: ${it}"}
-    .map { sample_id, fq1, fq2, single, keep_bam, to_remap_bam, remap_bam ->
-    tuple(sample_id, to_remap_bam, remap_bam) }
-    // .view {"After map: ${it}"}
-
-    FilterRemapReads(filter_remap_reads_input_ch)
-
-
-// ------------------------------------------
-// STEP 14: WASP step 4: MergeMappedReads
-// ------------------------------------------
-
-merge_remap_reads_input_ch = FindIntersectingSNPs.out
-    .join(FilterRemapReads.out)
-    // .view { "Before map: ${it}"}
-    .map { sample_id, fq1, fq2, single, keep_bam, to_remap_bam, remapped_filtered_bam ->
-    tuple(sample_id, keep_bam, remapped_filtered_bam) }
-    // .view {"After map: ${it}"}
-
-
-MergeRemapReads(merge_remap_reads_input_ch)
-
-// ------------------------------------------
-// STEP 14: WASP step 5: FilterDuplicateReads 
-// ------------------------------------------
-
-FilterDuplicateReads(MergeRemapReads.out)
-
-// ------------------------------------------
-// STEP 14: WASP step 6: SelectBiallelicSites 
-// ------------------------------------------
-
-SelectBiallelicSites(VariantFiltration.out)
-
-// ------------------------------------------
-// STEP 14: WASP step 7: ASEReadCounter 
-// ------------------------------------------
-
-ase_read_counter_input_ch = FilterDuplicateReads.out
-    .join(SelectBiallelicSites.out)
-    // .view { "before map: ${it}"}
-    .map { sample_id, dedup_sort_bam, dedup_sort_bai, biallelic_variants ->
-    tuple(sample_id, dedup_sort_bam, biallelic_variants) }
-    // .view { "after map: ${it}"}
-
-ASEReadCounter(ase_read_counter_input_ch)
-
-// ------------------------------------------
-// STEP 15: FeatureCounts 
-// ------------------------------------------
-
-// Perform featureCounts on the deduplicated BAM files from FilterDuplicateReads, same as used for ASEReadCounter
-featurecounts_input_ch = FilterDuplicateReads.out
-    .map {sample_id, dedup_sort_bam, dedup_sort_bai -> dedup_sort_bam }
-    .collect()
+    // ------------------------------------------
+    // STEP 16: WASP step 1: ExtractVcfSNPs
+    // ------------------------------------------
     
+    ExtractVcfSNPs(VariantFiltration.out)
 
-FeatureCounts_unstranded(featurecounts_input_ch, 0)
-FeatureCounts_stranded(featurecounts_input_ch, 1)
-FeatureCounts_reversely_stranded(featurecounts_input_ch, 2)
+    // ------------------------------------------
+    // STEP 17: WASP step 2: FindIntersectingSNPs
+    // ------------------------------------------
+
+    findintersectingsnps_input_ch = ApplyBQSR.out
+    .join(ExtractVcfSNPs.out)
+    // Optional debug output
+    // .view {before_map -> "Before map: ${before_map}"}
+    .map {sample_id_bam, bam_file, txt_snps ->
+    tuple(sample_id_bam, bam_file, txt_snps)
+    }
+    // Optional debug output
+    // .view {after_map -> "findintersectingsnps_input_ch: ${after_map}"}
+
+    FindIntersectingSNPs(findintersectingsnps_input_ch)
+
+    // ------------------------------------------
+    // STEP 18: WASP step 3: RemapReads
+    // ------------------------------------------
+
+    remap_reads_input_ch = FindIntersectingSNPs.out
+        .map { sample_id, fq1, fq2, _single, _keep_bam, _to_remap_bam -> // prefix '_' used to supress warning that those items are not being used 
+        tuple(sample_id, fq1, fq2) }
+        // Optional debug output
+        // .view { item -> "remap_reads_input: ${item}"}
+
+    RemapReads(remap_reads_input_ch)
+
+    // ------------------------------------------
+    // STEP 19: WASP step 4: FilterRemapReads
+    // ------------------------------------------
+
+    filter_remap_reads_input_ch = FindIntersectingSNPs.out
+        .join(RemapReads.out)
+        // Optional debug output
+        // .view {before_map -> "Before map: ${before_map}"}
+        .map { sample_id, _fq1, _fq2, _single, _keep_bam, to_remap_bam, remap_bam -> // prefix '_' used to supress warning that those items are not being used
+        tuple(sample_id, to_remap_bam, remap_bam) }
+        // Optional debug output
+        // .view {after_map -> "After map: ${after_map}"}
+
+        FilterRemapReads(filter_remap_reads_input_ch)
+
+    // ------------------------------------------
+    // STEP 20: WASP step 4: MergeMappedReads
+    // ------------------------------------------
+
+    merge_remap_reads_input_ch = FindIntersectingSNPs.out
+        .join(FilterRemapReads.out)
+        // Optional debug output
+        // .view { item -> "Before map: ${item}"}
+        .map { sample_id, _fq1, _fq2, _single, keep_bam, _to_remap_bam, remapped_filtered_bam -> // prefix '_' used to supress warning that those items are not being used
+        tuple(sample_id, keep_bam, remapped_filtered_bam) }
+        // Optional debug output
+        // .view {item -> "After map: ${item}"}
+
+
+    MergeRemapReads(merge_remap_reads_input_ch)
+
+    // ------------------------------------------
+    // STEP 21: WASP step 5: FilterDuplicateReads 
+    // ------------------------------------------
+
+    FilterDuplicateReads(MergeRemapReads.out)
+
+    // ------------------------------------------
+    // STEP 22: WASP step 6: SelectBiallelicSites 
+    // ------------------------------------------
+
+    SelectBiallelicSites(VariantFiltration.out)
+
+    // ------------------------------------------
+    // STEP 23: WASP step 7: ASEReadCounter 
+    // ------------------------------------------
+
+    ase_read_counter_input_ch = FilterDuplicateReads.out
+        .join(SelectBiallelicSites.out)
+        // Optional debug output
+        // .view { item -> "before map: ${item}"}
+        .map { sample_id, dedup_sort_bam, _dedup_sort_bai, biallelic_variants -> // prefix '_' used to supress warning that those items are not being used
+        tuple(sample_id, dedup_sort_bam, biallelic_variants) }
+        // Optional debug output
+        // .view { item -> "after map: ${item}"}
+
+    ASEReadCounter(ase_read_counter_input_ch)
+
+    // ------------------------------------------
+    // STEP 24: FeatureCounts 
+    // ------------------------------------------
+
+    // Perform featureCounts on the deduplicated BAM files from FilterDuplicateReads, same as used for ASEReadCounter
+    featurecounts_input_ch = FilterDuplicateReads.out
+        .map {_sample_id, dedup_sort_bam, _dedup_sort_bai -> dedup_sort_bam } // prefix '_' used to supress warning that those items are not being used
+        .collect()
+
+
+    FeatureCounts_unstranded(featurecounts_input_ch, 0)
+    FeatureCounts_stranded(featurecounts_input_ch, 1)
+    FeatureCounts_reversely_stranded(featurecounts_input_ch, 2)
 
 }
 
@@ -374,7 +361,7 @@ FeatureCounts_reversely_stranded(featurecounts_input_ch, 2)
 // =============================
 // PROCESS: CONCATENATE FASTQ
 // =============================
-process Concatenating_fastq {
+process Concatenate_fastq {
 
     tag "${sample_read}"
 
@@ -382,7 +369,7 @@ process Concatenating_fastq {
     tuple val(sample), val(sample_read), path(fastq_files)
 
     output:
-    tuple val(sample), val(sample_read), path("${sample_read}.fastq.gz")
+    tuple val(sample), val(sample_read), path("${sample_read}_${task.process}.fastq.gz")
     
 
     script:
